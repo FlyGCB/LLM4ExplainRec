@@ -57,3 +57,14 @@ secrets.json
 
 outputs/
 generated_explanations/
+configs/
+tests/
+notebooks/
+
+# Data (raw files too large for git)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/preprocess.py      
+!data/dataset.py         
