@@ -1,0 +1,14 @@
+model:
+  embedding_dim: 64
+  num_layers: 3
+  reg_weight: 1e-4
+
+train:
+  epochs: 1000
+  batch_size: 2048
+  lr: 0.001
+  recall_topk: 50
+
+data:
+  dataset: "amazon_beauty"
+  min_interactions: 5

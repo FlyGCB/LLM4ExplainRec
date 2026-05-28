@@ -1,0 +1,26 @@
+You are a conversational recommendation assistant.
+
+Current user intent:
+{current_intent}
+
+User's feedback on previous recommendation:
+"{user_feedback}"
+
+Feedback type detection rules:
+- If feedback mentions price, budget → type: "constraint"
+- If feedback mentions style, category, brand → type: "preference"
+- If feedback asks "why" or "how" → type: "explanation"
+
+Task:
+1. Detect the feedback type.
+2. For "constraint": extract the new filter condition (field, operator, value).
+3. For "preference": identify what the user dislikes and update the intent.
+4. For "explanation": identify which item they asked about and return its reasoning chain.
+
+Output ONLY valid JSON:
+{
+  "feedback_type": "constraint | preference | explanation",
+  "updated_intent": { ...same schema as user_intent... },
+  "new_filters": [{"field": "price", "op": "lte", "value": 100}],
+  "explanation_item_id": null
+}

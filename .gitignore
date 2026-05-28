@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Env
+.env
+.venv/
+venv/
+
+# Data (raw files too large for git)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Model checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db         
+
+# Logs
+logs/
+*.log
+wandb/
+runs/              # TensorBoard
+
+# HuggingFace cache
+*.cache/
+.cache/
+
+# Redis
+dump.rdb
+
+# API keys
+*.env
+.env.*
+secrets.yaml
+secrets.json
+
+
+outputs/
+generated_explanations/
