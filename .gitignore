@@ -69,3 +69,4 @@ data/processed/*
 !data/preprocess.py      
 !data/dataset.py         
 venv/
+venv/
