@@ -68,3 +68,4 @@ data/processed/*
 !data/processed/.gitkeep
 !data/preprocess.py      
 !data/dataset.py         
+venv/
