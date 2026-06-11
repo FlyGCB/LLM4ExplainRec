@@ -3,6 +3,14 @@ Batch evaluation script.
 Metrics:
   - Recall@K, NDCG@K  (recall layer: SASRec / LightGCN / Fusion)
   - BERTScore F1       (explanation quality, sampled)
+
+Index convention:
+  - interactions.parquet / test.parquet: item_id is 0-indexed (0 ~ num_items-1)
+  - SASRec item_emb:  0 = padding, items are 1-indexed (1 ~ num_items)
+    → SASRec topk indices are 1-indexed, must compare with (true_item + 1)
+  - LightGCN item_emb: 0-indexed (0 ~ num_items-1)
+    → LightGCN topk indices are 0-indexed, compare directly with true_item
+
 Usage: python batch_evaluate.py
 """
 import os
@@ -19,13 +27,13 @@ from openai import OpenAI
 load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-RECALL_K          = 50
-NDCG_K            = 10
-EXPLAIN_SAMPLES   = 100          # BERTScore on N users (API cost control)
-MODEL_NAME        = "deepseek-ai/DeepSeek-V3"
-BASE_URL          = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
-API_KEY           = os.environ.get("SILICONFLOW_API_KEY", "")
-BATCH_SIZE        = 512          # users per batch for recall eval
+RECALL_K        = 50
+NDCG_K          = 10
+EXPLAIN_SAMPLES = 100
+MODEL_NAME      = "deepseek-ai/DeepSeek-V3"
+BASE_URL        = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+API_KEY         = os.environ.get("SILICONFLOW_API_KEY", "")
+BATCH_SIZE      = 512
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 print("Loading data...")
@@ -44,10 +52,9 @@ def item_to_title(item_id: int) -> str:
         return f"item_{item_id}"
     return asin_to_title.get(asin, f"item_{item_id}")
 
-df_sorted = df.sort_values(["user_id","timestamp"])
+df_sorted = df.sort_values(["user_id", "timestamp"])
 user_seqs = df_sorted.groupby("user_id")["item_id"].apply(list).to_dict()
-
-test_data = list(test_df.itertuples(index=False, name=None))   # [(user_id, item_id)]
+test_data = list(test_df.itertuples(index=False, name=None))
 print(f"  Test users: {len(test_data):,}")
 
 # ── Load models ───────────────────────────────────────────────────────────────
@@ -67,49 +74,55 @@ lightgcn.load_state_dict(torch.load("checkpoints/lightgcn_best.pt", map_location
 lightgcn.eval()
 
 edge_index = build_edge_index(df, num_users, device)
-
 print("  Models loaded.")
 
-# ── Recall helpers ────────────────────────────────────────────────────────────
+# ── Metrics ───────────────────────────────────────────────────────────────────
 def ndcg_at_k(ranked_list, true_item, k):
     if true_item not in ranked_list[:k]:
         return 0.0
     rank = ranked_list[:k].index(true_item) + 1
     return 1.0 / np.log2(rank + 1)
 
-
+# ── SASRec eval ───────────────────────────────────────────────────────────────
 def eval_sasrec_batch(test_data, k=50):
+    """
+    SASRec is 1-indexed: predict() scores items 1..num_items.
+    true_item from test.parquet is 0-indexed → compare with (true_item + 1).
+    """
     hits, ndcg_sum = 0, 0.0
     MAX_LEN = 50
 
     for start in tqdm(range(0, len(test_data), BATCH_SIZE), desc="SASRec eval"):
-        batch     = test_data[start:start+BATCH_SIZE]
+        batch = test_data[start:start+BATCH_SIZE]
         seqs, true_items = [], []
-
         for uid, true_item in batch:
             seq = user_seqs.get(uid, [])[-MAX_LEN:]
             pad = [0] * (MAX_LEN - len(seq))
             seqs.append(pad + seq)
             true_items.append(true_item)
 
-        seq_tensor = torch.tensor(seqs, dtype=torch.long).to(device)  # (B, L)
+        seq_tensor = torch.tensor(seqs, dtype=torch.long).to(device)
 
         with torch.no_grad():
-            all_items = torch.arange(1, num_items+1, device=device)
-            # score each user against all items
-            scores  = sasrec.predict(seq_tensor, all_items)            # (B, num_items)
-            topk    = scores.topk(k, dim=-1).indices + 1               # (B, k) 1-indexed
+            all_items = torch.arange(1, num_items + 1, device=device)
+            scores    = sasrec.predict(seq_tensor, all_items)        # (B, num_items)
+            topk      = scores.topk(k, dim=-1).indices + 1          # 1-indexed
 
         for i, true_item in enumerate(true_items):
-            ranked = topk[i].tolist()
-            hits     += int(true_item in ranked)
-            ndcg_sum += ndcg_at_k(ranked, true_item, NDCG_K)
+            ranked    = topk[i].tolist()                             # 1-indexed list
+            target    = true_item + 1                                # shift to 1-indexed
+            hits     += int(target in ranked)
+            ndcg_sum += ndcg_at_k(ranked, target, NDCG_K)
 
     n = len(test_data)
-    return {"Recall@50": hits/n, "NDCG@10": ndcg_sum/n}
+    return {"Recall@50": hits / n, "NDCG@10": ndcg_sum / n}
 
-
+# ── LightGCN eval ─────────────────────────────────────────────────────────────
 def eval_lightgcn_batch(test_data, k=50):
+    """
+    LightGCN is 0-indexed: item_embs[0..num_items-1].
+    true_item is 0-indexed → compare directly.
+    """
     hits, ndcg_sum = 0, 0.0
 
     with torch.no_grad():
@@ -117,23 +130,26 @@ def eval_lightgcn_batch(test_data, k=50):
 
     for start in tqdm(range(0, len(test_data), BATCH_SIZE), desc="LightGCN eval"):
         batch = test_data[start:start+BATCH_SIZE]
-        uids  = torch.tensor([u for u,_ in batch], dtype=torch.long, device=device)
+        uids  = torch.tensor([u for u, _ in batch], dtype=torch.long, device=device)
 
         with torch.no_grad():
-            scores = user_embs[uids] @ item_embs.T      # (B, num_items)
-            topk   = scores.topk(k, dim=-1).indices      # (B, k) 0-indexed
+            scores = user_embs[uids] @ item_embs.T                  # (B, num_items)
+            topk   = scores.topk(k, dim=-1).indices                  # 0-indexed
 
         for i, (_, true_item) in enumerate(batch):
-            ranked   = topk[i].tolist()
+            ranked    = topk[i].tolist()                             # 0-indexed list
             hits     += int(true_item in ranked)
             ndcg_sum += ndcg_at_k(ranked, true_item, NDCG_K)
 
     n = len(test_data)
-    return {"Recall@50": hits/n, "NDCG@10": ndcg_sum/n}
+    return {"Recall@50": hits / n, "NDCG@10": ndcg_sum / n}
 
-
+# ── Fusion eval ───────────────────────────────────────────────────────────────
 def eval_fusion_batch(test_data, k=50):
-    """Union of SASRec + LightGCN candidates, up to k."""
+    """
+    Merge SASRec (1-indexed) + LightGCN (0-indexed) by normalising both to 0-indexed.
+    SASRec topk: subtract 1 → 0-indexed before merging.
+    """
     hits, ndcg_sum = 0, 0.0
     MAX_LEN = 50
 
@@ -150,23 +166,22 @@ def eval_fusion_batch(test_data, k=50):
             true_items.append(true_item)
 
         seq_tensor = torch.tensor(seqs, dtype=torch.long).to(device)
-        uids       = torch.tensor([u for u,_ in batch], dtype=torch.long, device=device)
+        uids       = torch.tensor([u for u, _ in batch], dtype=torch.long, device=device)
 
         with torch.no_grad():
-            s_scores  = sasrec.predict(seq_tensor, torch.arange(1, num_items+1, device=device))
-            s_topk    = (s_scores.topk(k, dim=-1).indices + 1).tolist()   # 1-indexed
+            s_scores = sasrec.predict(seq_tensor, torch.arange(1, num_items + 1, device=device))
+            s_topk   = (s_scores.topk(k, dim=-1).indices).tolist()  # 0-indexed (no +1)
 
-            g_scores  = user_embs[uids] @ item_embs.T
-            g_topk    = g_scores.topk(k, dim=-1).indices.tolist()          # 0-indexed
+            g_scores = user_embs[uids] @ item_embs.T
+            g_topk   = g_scores.topk(k, dim=-1).indices.tolist()    # 0-indexed
 
         for i, true_item in enumerate(true_items):
-            merged = list(dict.fromkeys(s_topk[i] + g_topk[i]))[:k]
+            merged    = list(dict.fromkeys(s_topk[i] + g_topk[i]))[:k]  # all 0-indexed
             hits     += int(true_item in merged)
             ndcg_sum += ndcg_at_k(merged, true_item, NDCG_K)
 
     n = len(test_data)
-    return {"Recall@50": hits/n, "NDCG@10": ndcg_sum/n}
-
+    return {"Recall@50": hits / n, "NDCG@10": ndcg_sum / n}
 
 # ── Run recall evaluation ─────────────────────────────────────────────────────
 print("\n" + "="*60)
@@ -193,18 +208,16 @@ if API_KEY:
     print(f"EXPLANATION QUALITY (BERTScore, {EXPLAIN_SAMPLES} users)")
     print("="*60)
 
-    client   = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+    client     = OpenAI(api_key=API_KEY, base_url=BASE_URL)
     hyps, refs = [], []
-    sample   = test_data[:EXPLAIN_SAMPLES]
 
-    for uid, true_item in tqdm(sample, desc="Generating explanations"):
+    for uid, true_item in tqdm(test_data[:EXPLAIN_SAMPLES], desc="Generating explanations"):
         seq = user_seqs.get(uid, [])[-10:]
         if len(seq) < 3:
             continue
 
         history_str = "\n".join(f"{i+1}. {item_to_title(iid)}" for i, iid in enumerate(seq))
 
-        # Causal CoT
         cot_prompt = f"""You are an e-commerce analyst. Given the user's purchase sequence, output ONLY valid JSON:
 {{"goal": "...", "motivation": "...", "constraint": "..."}}
 
@@ -212,18 +225,17 @@ User sequence:
 {history_str}"""
 
         try:
-            r1 = client.chat.completions.create(
+            r1         = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[{"role": "user", "content": cot_prompt}],
                 temperature=0.2, max_tokens=200,
             )
-            intent_raw   = re.sub(r"```(?:json)?|```", "", r1.choices[0].message.content).strip()
-            intent       = json.loads(intent_raw)
-            intent_str   = json.dumps(intent, ensure_ascii=False)
+            intent_raw = re.sub(r"```(?:json)?|```", "", r1.choices[0].message.content).strip()
+            intent     = json.loads(intent_raw)
+            intent_str = json.dumps(intent, ensure_ascii=False)
         except Exception:
-            intent_str = f'{{"goal": "outdoor activities", "motivation": "fitness", "constraint": "lightweight gear"}}'
+            intent_str = '{"goal": "outdoor activities", "motivation": "fitness", "constraint": "lightweight gear"}'
 
-        # Faithful rerank — just top-1 explanation
         MAX_LEN    = 50
         seq_tensor = torch.tensor(seq[-MAX_LEN:], dtype=torch.long).unsqueeze(0).to(device)
         pad_len    = MAX_LEN - seq_tensor.shape[1]
@@ -231,9 +243,9 @@ User sequence:
             seq_tensor = torch.cat([torch.zeros(1, pad_len, dtype=torch.long, device=device), seq_tensor], dim=1)
 
         with torch.no_grad():
-            all_items = torch.arange(1, num_items+1, device=device)
-            scores    = sasrec.predict(seq_tensor, all_items).squeeze(0)
-            topk_ids  = (scores.topk(10).indices + 1).tolist()
+            all_items  = torch.arange(1, num_items + 1, device=device)
+            scores     = sasrec.predict(seq_tensor, all_items).squeeze(0)
+            topk_ids   = scores.topk(10).indices.tolist()           # 0-indexed for title lookup
 
         candidates_str = "\n".join(f"ID:{iid} | {item_to_title(iid)}" for iid in topk_ids)
 
@@ -246,7 +258,7 @@ Output ONLY a JSON array with 1 item:
 [{{"rank":1,"item_id":0,"title":"...","explanation":"...","grounding":"based on your purchase of ..."}}]"""
 
         try:
-            r2 = client.chat.completions.create(
+            r2     = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[{"role": "user", "content": rerank_prompt}],
                 temperature=0.2, max_tokens=300,
@@ -269,7 +281,7 @@ Output ONLY a JSON array with 1 item:
 else:
     print("\nSkipping BERTScore (no API key found in .env)")
 
-# ── Summary table ─────────────────────────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────────────────────────────
 print("\n" + "="*60)
 print("SUMMARY")
 print("="*60)
@@ -277,11 +289,10 @@ print(f"{'Model':<20} {'Recall@50':>10} {'NDCG@10':>10}")
 print("-"*42)
 for model, m in results.items():
     if isinstance(m, dict):
-        print(f"{model:<20} {m.get('Recall@50',0):>10.4f} {m.get('NDCG@10',0):>10.4f}")
+        print(f"{model:<20} {m.get('Recall@50', 0):>10.4f} {m.get('NDCG@10', 0):>10.4f}")
 if "BERTScore_F1" in results:
     print(f"\n{'BERTScore F1':<20} {results['BERTScore_F1']:>10.4f}")
 
-# Save results
 Path("outputs").mkdir(exist_ok=True)
 with open("outputs/eval_results.json", "w") as f:
     json.dump(results, f, indent=2)
