@@ -106,11 +106,11 @@ def eval_sasrec_batch(test_data, k=50):
         with torch.no_grad():
             all_items = torch.arange(1, num_items + 1, device=device)
             scores    = sasrec.predict(seq_tensor, all_items)        # (B, num_items)
-            topk      = scores.topk(k, dim=-1).indices + 1          # 1-indexed
+            topk      = scores.topk(k, dim=-1).indices          # 1-indexed
 
         for i, true_item in enumerate(true_items):
             ranked    = topk[i].tolist()                             # 1-indexed list
-            target    = true_item + 1                                # shift to 1-indexed
+            target    = true_item                                # shift to 1-indexed
             hits     += int(target in ranked)
             ndcg_sum += ndcg_at_k(ranked, target, NDCG_K)
 
