@@ -6,10 +6,9 @@ Metrics:
 
 Index convention:
   - interactions.parquet / test.parquet: item_id is 0-indexed (0 ~ num_items-1)
-  - SASRec item_emb:  0 = padding, items are 1-indexed (1 ~ num_items)
-    → SASRec topk indices are 1-indexed, must compare with (true_item + 1)
-  - LightGCN item_emb: 0-indexed (0 ~ num_items-1)
-    → LightGCN topk indices are 0-indexed, compare directly with true_item
+  - SASRec predict(seq, arange(0, num_items)): scores[i] = score for item i (0-indexed)
+  - LightGCN item_embs: 0-indexed
+  - All comparisons use true_item directly (0-indexed)
 
 Usage: python batch_evaluate.py
 """
@@ -85,12 +84,10 @@ def ndcg_at_k(ranked_list, true_item, k):
 
 # ── SASRec eval ───────────────────────────────────────────────────────────────
 def eval_sasrec_batch(test_data, k=50):
-    """
-    SASRec is 1-indexed: predict() scores items 1..num_items.
-    true_item from test.parquet is 0-indexed → compare with (true_item + 1).
-    """
     hits, ndcg_sum = 0, 0.0
     MAX_LEN = 50
+    # Use arange(0, num_items) so scores[i] = score for item i (0-indexed)
+    all_items = torch.arange(0, num_items, device=device)
 
     for start in tqdm(range(0, len(test_data), BATCH_SIZE), desc="SASRec eval"):
         batch = test_data[start:start+BATCH_SIZE]
@@ -104,25 +101,19 @@ def eval_sasrec_batch(test_data, k=50):
         seq_tensor = torch.tensor(seqs, dtype=torch.long).to(device)
 
         with torch.no_grad():
-            all_items = torch.arange(1, num_items + 1, device=device)
-            scores    = sasrec.predict(seq_tensor, all_items)        # (B, num_items)
-            topk      = scores.topk(k, dim=-1).indices + 1
+            scores = sasrec.predict(seq_tensor, all_items)   # (B, num_items)
+            topk   = scores.topk(k, dim=-1).indices          # 0-indexed
 
         for i, true_item in enumerate(true_items):
-            ranked    = topk[i].tolist()                             # 1-indexed list
-            target    = true_item + 1
-            hits     += int(target in ranked)
-            ndcg_sum += ndcg_at_k(ranked, target, NDCG_K)
+            ranked    = topk[i].tolist()
+            hits     += int(true_item in ranked)
+            ndcg_sum += ndcg_at_k(ranked, true_item, NDCG_K)
 
     n = len(test_data)
     return {"Recall@50": hits / n, "NDCG@10": ndcg_sum / n}
 
 # ── LightGCN eval ─────────────────────────────────────────────────────────────
 def eval_lightgcn_batch(test_data, k=50):
-    """
-    LightGCN is 0-indexed: item_embs[0..num_items-1].
-    true_item is 0-indexed → compare directly.
-    """
     hits, ndcg_sum = 0, 0.0
 
     with torch.no_grad():
@@ -133,11 +124,11 @@ def eval_lightgcn_batch(test_data, k=50):
         uids  = torch.tensor([u for u, _ in batch], dtype=torch.long, device=device)
 
         with torch.no_grad():
-            scores = user_embs[uids] @ item_embs.T                  # (B, num_items)
-            topk   = scores.topk(k, dim=-1).indices                  # 0-indexed
+            scores = user_embs[uids] @ item_embs.T   # (B, num_items)
+            topk   = scores.topk(k, dim=-1).indices   # 0-indexed
 
         for i, (_, true_item) in enumerate(batch):
-            ranked    = topk[i].tolist()                             # 0-indexed list
+            ranked    = topk[i].tolist()
             hits     += int(true_item in ranked)
             ndcg_sum += ndcg_at_k(ranked, true_item, NDCG_K)
 
@@ -146,12 +137,10 @@ def eval_lightgcn_batch(test_data, k=50):
 
 # ── Fusion eval ───────────────────────────────────────────────────────────────
 def eval_fusion_batch(test_data, k=50):
-    """
-    Merge SASRec (1-indexed) + LightGCN (0-indexed) by normalising both to 0-indexed.
-    SASRec topk: subtract 1 → 0-indexed before merging.
-    """
+    """Both SASRec and LightGCN produce 0-indexed topk, merge directly."""
     hits, ndcg_sum = 0, 0.0
     MAX_LEN = 50
+    all_items = torch.arange(0, num_items, device=device)
 
     with torch.no_grad():
         user_embs, item_embs = lightgcn(edge_index)
@@ -169,14 +158,14 @@ def eval_fusion_batch(test_data, k=50):
         uids       = torch.tensor([u for u, _ in batch], dtype=torch.long, device=device)
 
         with torch.no_grad():
-            s_scores = sasrec.predict(seq_tensor, torch.arange(1, num_items + 1, device=device))
-            s_topk   = s_scores.topk(k, dim=-1).indices.tolist()  # 0-indexed
+            s_scores = sasrec.predict(seq_tensor, all_items)
+            s_topk   = s_scores.topk(k, dim=-1).indices.tolist()   # 0-indexed
 
             g_scores = user_embs[uids] @ item_embs.T
-            g_topk   = g_scores.topk(k, dim=-1).indices.tolist()    # 0-indexed
+            g_topk   = g_scores.topk(k, dim=-1).indices.tolist()   # 0-indexed
 
         for i, true_item in enumerate(true_items):
-            merged    = list(dict.fromkeys(s_topk[i] + g_topk[i]))[:k]  # all 0-indexed
+            merged    = list(dict.fromkeys(s_topk[i] + g_topk[i]))[:k]
             hits     += int(true_item in merged)
             ndcg_sum += ndcg_at_k(merged, true_item, NDCG_K)
 
@@ -243,9 +232,9 @@ User sequence:
             seq_tensor = torch.cat([torch.zeros(1, pad_len, dtype=torch.long, device=device), seq_tensor], dim=1)
 
         with torch.no_grad():
-            all_items  = torch.arange(1, num_items + 1, device=device)
-            scores     = sasrec.predict(seq_tensor, all_items).squeeze(0)
-            topk_ids   = scores.topk(10).indices.tolist()           # 0-indexed for title lookup
+            all_items_llm = torch.arange(0, num_items, device=device)
+            scores        = sasrec.predict(seq_tensor, all_items_llm).squeeze(0)
+            topk_ids      = scores.topk(10).indices.tolist()  # 0-indexed
 
         candidates_str = "\n".join(f"ID:{iid} | {item_to_title(iid)}" for iid in topk_ids)
 

@@ -72,33 +72,76 @@ Behavior Sequence
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Download data & run full pipeline
-bash scripts/run_pipeline.sh
+# 2. Download data
+python download_data.py
 
-# 3. Start API server
-export OPENAI_API_KEY=sk-...
-uvicorn service.main:app --reload
+# 3. Preprocess
+python data/preprocess.py
 
-# 4. Try it
-curl http://localhost:8000/rec/user_123
+# 4. Train recall models
+python -m models.sasrec.train --config configs/sasrec.yaml
+python -m models.lightgcn.train --config configs/lightgcn.yaml
+
+# 5. Run evaluation
+python batch_evaluate.py
+
+# 6. Test end-to-end pipeline (requires API key in .env)
+python test_pipeline.py
 ```
 
 ---
 
 ## Experiments
 
-**Dataset**: Amazon Product Reviews — Beauty (5-core)
-- ~198K interactions | 22K users | 12K items
+### Dataset
 
-**Baselines**: MF · LightGCN · SASRec · LLMRank · E4SRec
+Amazon Product Reviews 2023 — three categories merged (Sports & Outdoors, Cell Phones & Accessories, Clothing Shoes & Jewelry), 5-core filtered, leave-one-out split.
 
-**Metrics**:
-- Recommendation: Recall@50, NDCG@50
-- Explanation quality: BERTScore-F1, Faithfulness Score (GPT-4 judge)
+| Split | Users | Items | Interactions |
+|---|---|---|---|
+| Train | 425,812 | 161,362 | 2,773,820 |
+| Val | 425,812 | — | 425,812 |
+| Test | 425,812 | — | 425,812 |
 
-```bash
-python evaluate.py --split test --k 50 --explain_samples 200
-```
+### Recall Results
+
+Evaluated on full test set (425,812 users), Recall@50 and NDCG@10:
+
+| Model | Recall@50 | NDCG@10 |
+|---|---|---|
+| SASRec (sequential) | 0.0443 | 0.0137 |
+| LightGCN (collaborative) | **0.0544** | **0.0139** |
+| Fusion (SASRec + LightGCN) | 0.0443 | 0.0137 |
+
+LightGCN outperforms SASRec on this dataset due to the multi-category nature of the data — collaborative filtering captures cross-category purchase patterns that sequential models miss.
+
+### Explanation Quality
+
+Evaluated on 100 sampled users. LLM generates natural language explanations grounded in user history; quality measured via BERTScore against self-generated grounding statements.
+
+| Metric | Score |
+|---|---|
+| BERTScore F1 | **0.8677** |
+
+### Qualitative Example
+
+**User history** (last 7 interactions):
+1. Foxelli Carbon Fiber Trekking Poles
+2. RAMBO III Hunting Knife
+3. Valeo Slimmer Belt
+4. Danskin Waist Trimmer Belt
+5. Goodyear 29×2.1 MTB Tire
+6. ICOCOPRO CO2 Bike Tire Inflator
+7. Gorilla Force CO2 Cartridges
+
+**Inferred intent (Causal CoT)**:
+- **Goal**: Prepare for outdoor adventure, possibly hiking or mountain biking
+- **Motivation**: Fitness and outdoor exploration with durable, multi-terrain gear
+- **Constraint**: Lightweight, portable, and multi-functional equipment
+
+**Top recommendation with explanation**:
+> *"This bike light is essential for safe mountain biking or night-time outdoor adventures, complementing your recent purchase of the Goodyear MTB tire and CO2 inflator."*
+> — Grounded in: Goodyear 29×2.1 MTB Tire + ICOCOPRO CO2 Inflator
 
 ---
 
@@ -123,11 +166,11 @@ LLM4ExplainRec/
 │   ├── cache.py             # Redis cache layer
 │   └── schemas.py           # Pydantic request/response models
 ├── configs/                 # YAML hyperparameters
-├── notebooks/               # EDA + evaluation analysis
 ├── pipeline.py              # End-to-end recall orchestration
-├── evaluate.py              # Recall + BERTScore evaluation
+├── batch_evaluate.py        # Recall + BERTScore batch evaluation
+├── test_pipeline.py         # End-to-end single-user pipeline test
 └── scripts/
-    ├── download_data.sh
+    ├── download_data.py
     └── run_pipeline.sh
 ```
 
@@ -140,3 +183,4 @@ LLM4ExplainRec/
 - Hou et al., *LLMRank* (RecSys 2023)
 - Lin et al., *E4SRec* (2024)
 - Wei et al., *Chain-of-Thought Prompting Elicits Reasoning in LLMs* (NeurIPS 2022)
+- Zhang et al., *BERTScore: Evaluating Text Generation with BERT* (ICLR 2020)
